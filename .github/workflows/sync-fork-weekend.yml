@@ -1,0 +1,22 @@
+name: Sync fork every weekend
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork with upstream
+        uses: repo-sync/github-sync@v2
+        with:
+          source_repo: ${{ github.event.repository.parent.full_name }}
+          source_branch: ${{ github.event.repository.default_branch }}
+          destination_branch: ${{ github.event.repository.default_branch }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

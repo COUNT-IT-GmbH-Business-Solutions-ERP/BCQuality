@@ -27,6 +27,9 @@ jobs:
             core.setOutput('full_name', data.parent.full_name);
             core.setOutput('default_branch', data.parent.default_branch);
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Sync fork with upstream
         uses: repo-sync/github-sync@v2
         with:

@@ -42,6 +42,7 @@ ACTION_SKILL_OPTIONAL_KEYS = {
 }
 META_SKILL_REQUIRED_KEYS = {"kind", "id", "version", "title"}
 ENTRY_SKILL_REQUIRED_KEYS = {"kind", "id", "version", "title"}
+HOST_SKILL_REQUIRED_KEYS = {"name", "description"}
 
 STANDARD_INPUTS = {
     "pr-diff", "object-list", "file-path", "repository", "telemetry-query",
@@ -62,6 +63,7 @@ ISO_ALPHA2 = re.compile(r"^[a-z]{2}$")
 RANGE_SHORTHAND = re.compile(r"^(\d+)\.\.(\d+)?$")
 FENCED_CODE_BLOCK = re.compile(r"^```", re.MULTILINE)
 HEADING_H2 = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+SAMPLE_REFERENCE = re.compile(r"`([a-z0-9]+(?:-[a-z0-9]+)*\.(?:good|bad)\.[a-z0-9]+)`")
 
 
 # --- Diagnostics ------------------------------------------------------------
@@ -222,6 +224,13 @@ def validate_knowledge(path: Path, parsed: Parsed, report: Report) -> None:
     if "domain" in fm:
         if not isinstance(fm["domain"], str) or not fm["domain"].strip():
             report.error(path, "R04", "domain must be a non-empty string", 1)
+        elif fm["domain"] != path.parent.name:
+            report.error(
+                path,
+                "R27",
+                f"frontmatter domain '{fm['domain']}' must match directory '{path.parent.name}'",
+                1,
+            )
 
     # R05 keywords
     if "keywords" in fm:
@@ -436,10 +445,36 @@ def validate_entry_skill(path: Path, parsed: Parsed, report: Report) -> None:
             report.error(path, "R23", f"version must be a positive integer: {v!r}", 1)
 
 
+def validate_host_skill(path: Path, parsed: Parsed, report: Report) -> None:
+    if parsed.frontmatter_error:
+        report.error(path, "R01", parsed.frontmatter_error, 1)
+        return
+    fm = parsed.frontmatter
+    assert fm is not None
+    missing = HOST_SKILL_REQUIRED_KEYS - fm.keys()
+    if missing:
+        report.error(path, "R29", f"missing required host-skill keys: {sorted(missing)}", 1)
+
+    name = fm.get("name")
+    if not isinstance(name, str) or not name:
+        report.error(path, "R29", "host-skill name must be a non-empty string", 1)
+    else:
+        if len(name) > 64 or not KEBAB_CASE.fullmatch(name):
+            report.error(path, "R29", f"host-skill name must be lowercase kebab-case and at most 64 characters: '{name}'", 1)
+        if name != path.parent.name:
+            report.error(path, "R29", f"host-skill name must match parent directory '{path.parent.name}', got '{name}'", 1)
+
+    description = fm.get("description")
+    if not isinstance(description, str) or not description:
+        report.error(path, "R29", "host-skill description must be a non-empty string", 1)
+    elif len(description) > 1024:
+        report.error(path, "R29", "host-skill description must be at most 1024 characters", 1)
+
+
 # --- Path and sample checks -------------------------------------------------
 
 def classify(path_from_root: Path) -> str | None:
-    """Return 'knowledge' | 'action-skill' | 'meta' | 'entry' | None."""
+    """Return 'knowledge' | 'action-skill' | 'host-skill' | 'meta' | 'entry' | None."""
     parts = path_from_root.parts
     if len(parts) < 2:
         return None
@@ -451,6 +486,8 @@ def classify(path_from_root: Path) -> str | None:
                 return "entry"
             if name in META_SKILL_FILES:
                 return "meta"
+        if len(parts) == 3 and parts[2] == "SKILL.md":
+            return "host-skill"
         return None
     if top in LAYERS and path_from_root.suffix == ".md":
         if len(parts) >= 3 and parts[1] == "skills":
@@ -477,7 +514,16 @@ def validate_samples_in_domain(domain_dir: Path, root: Path, report: Report) -> 
     """R14: every non-.md file must match <slug>.<kind>.<ext> with <slug>.md present."""
     if not domain_dir.is_dir():
         return
-    article_slugs = {p.stem for p in domain_dir.glob("*.md")}
+    articles = {p.stem: p for p in domain_dir.glob("*.md")}
+    article_slugs = set(articles)
+    article_texts: dict[str, str] = {}
+    for slug, article in articles.items():
+        try:
+            article_texts[slug] = article.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # R01 reports this during the article pass.
+            continue
+
     for entry in domain_dir.iterdir():
         if not entry.is_file() or entry.suffix == ".md":
             continue
@@ -491,8 +537,23 @@ def validate_samples_in_domain(domain_dir: Path, root: Path, report: Report) -> 
         kind = m.group("kind")
         if slug not in article_slugs:
             report.error(entry, "R14", f"orphan sample: no matching article '{slug}.md' in {domain_dir.relative_to(root).as_posix()}")
+        elif entry.name not in article_texts.get(slug, ""):
+            report.error(
+                entry,
+                "R28",
+                f"sample is not referenced by its article '{slug}.md'",
+            )
         if kind not in VALID_SAMPLE_KINDS:
             report.warn(entry, "R14", f"non-standard sample kind '{kind}'; standard kinds are {sorted(VALID_SAMPLE_KINDS)}")
+
+    for slug, article in articles.items():
+        for sample_name in SAMPLE_REFERENCE.findall(article_texts.get(slug, "")):
+            if not (domain_dir / sample_name).is_file():
+                report.error(
+                    article,
+                    "R28",
+                    f"referenced sample does not exist: '{sample_name}'",
+                )
 
 
 # --- Orchestration ----------------------------------------------------------
@@ -584,6 +645,8 @@ def run(root: Path) -> Report:
             validate_entry_skill(path, parsed, report)
             if parsed.frontmatter and isinstance(parsed.frontmatter.get("id"), str):
                 skill_records.append(SkillRecord(path, "entry-point", parsed.frontmatter["id"]))
+        elif kind == "host-skill":
+            validate_host_skill(path, parsed, report)
 
     # Second pass: sample files per knowledge domain
     for layer in LAYERS:

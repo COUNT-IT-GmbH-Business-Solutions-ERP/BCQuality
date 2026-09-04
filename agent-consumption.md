@@ -12,6 +12,10 @@ For the high-level framing and repo structure, start with the [README](README.md
   - **Global skills** in `/skills/` — the `entry.md` entry-point skill plus the READ · DO · WRITE contracts that govern the rest of the repo.
   - **Layer content** in `/microsoft/`, `/community/`, and `/custom/` — knowledge files and action skills grouped by authority.
 
+When BCQuality is installed as a standalone plugin, it additionally exposes
+`skills/al-code-review/SKILL.md`. This is a host-format adapter, not another
+action skill: it creates the task context and enters the same flow at Entry.
+
 ## The flow
 
 ```mermaid
@@ -21,7 +25,7 @@ flowchart LR
     E -->|3 dispatch record| A
     A -->|4 invoke dispatched skill| S[Action skill<br/>e.g. al-code-review]
     S -->|5 execute| P[Source → Relevance<br/>→ Worklist → Action<br/>reading READ · DO on demand]
-    P -->|6 emit| R[Findings · References<br/>· Confidence]
+    P -->|6 emit| R[Findings · Domain labels<br/>· References · Confidence]
     R -->|7 integrate| O
 ```
 
@@ -30,6 +34,12 @@ The orchestrator has a URL setting that points at BCQuality (default: `github.co
 
 ### 2. Agent invokes Entry
 The agent reads `/skills/entry.md` and runs it against the task context. Entry applies its Source → Relevance → Worklist → Action steps over the action skills under `*/skills/**/*.md` and returns a **dispatch record**: the set of action skills to invoke, plus a list of candidates it skipped (with reasons). Routing is a skill, not orchestrator logic.
+
+For a standalone plugin installation, the host activates the
+`skills/al-code-review/SKILL.md` adapter first. That adapter preserves the
+caller's actual goal, constructs the task context, and invokes Entry. It does
+not select the internal `microsoft/skills/review/al-code-review.md` action skill
+itself or duplicate Entry's preparation, routing, and failure semantics.
 
 ### 3. Agent consumes the dispatch record
 The dispatch record names one or more action skills and the subset of inputs each should receive. If the outcome is `no-match` or `failed`, the agent returns the record to the orchestrator unchanged.
@@ -48,7 +58,7 @@ Each action skill is a markdown file that specifies what to do at each step. The
 | **Worklist** | Narrow from N candidates to the M that apply to this specific task. |
 | **Action** | Apply the relevant knowledge and produce structured output. |
 
-Example: a performance review skill sources from `/microsoft/knowledge/performance/` and `/community/knowledge/performance/`, filters to `bc-version: 26` and `technologies: [al]`, narrows the 25 candidate files to the 8 that apply to the 15 objects changed in the PR, and then evaluates each file against the diff.
+Example: the Microsoft-owned performance review skill selects `performance` entries across every enabled layer, filters to `bc-version: 26` and `technologies: [al]`, narrows the candidate files to those that apply to the changed objects, and then evaluates each file against the diff. Its canonical corpus lives beside it under `/microsoft/knowledge/performance/`; cross-layer entries are limited to custom overrides or short-lived promotion work.
 
 At this point the agent reads READ and DO on demand — it needs READ to interpret each knowledge file's frontmatter and sections, and DO to shape its output. Those contracts are fetched when first needed, not as part of bootstrap.
 
@@ -65,6 +75,7 @@ The output contract is defined in the DO meta-skill so that every action skill �
 
 - **Outcome** — `completed`, `not-applicable`, `no-knowledge`, `partial`, or `failed`. An orchestrator can distinguish a clean run from a no-op from a failure without guessing.
 - **Findings** — what the skill observed (severity, message, optional location).
+- **Domain** — the producer-owned, human-readable display label on each review finding.
 - **References** — structured objects (`path` plus optional commit `sha`) pointing to the knowledge files that informed each finding.
 - **Confidence** — per-finding evidence strength.
 - **Suppressed** — knowledge files that were discarded by layer precedence or configuration, so reviewers can see what was overridden.
@@ -78,18 +89,22 @@ The orchestrator turns findings into PR comments, build gates, or IDE diagnostic
 
 BCQuality is an **additive** knowledge layer. The agent surfaces two kinds of findings, both shaped to the same DO output contract:
 
-- **Knowledge-backed findings** carry one or more entries in `references[]` pointing at BCQuality knowledge files. Their `id` is the primary file's repo-relative path. These are produced by leaf sub-skills and rolled up by super-skills.
-- **Agent findings** are surfaced by a super-skill from its own self-review pass when no BCQuality knowledge file backs the concern. They are tagged with `from-sub-skill: "agent"`, carry an empty `references: []`, use a slug `id` prefixed `agent:`, and have `confidence` capped at `medium`. Their `message` is self-contained because there is no knowledge-file footer to fall back on.
+- **Knowledge-backed findings** carry one or more entries in `references[]` pointing at BCQuality knowledge files. Their `id` is the primary file's repo-relative path. Leaf sub-skills set `domain` to their human-readable display label, and super-skills preserve it verbatim during rollup.
+- **Agent findings** carry an empty `references: []`, use a slug `id` prefixed `agent:`, and have `confidence` capped at `medium`. A leaf can emit one strictly within its own domain and uses that leaf's display label. A super-skill can emit a cross-cutting agent finding with `from-sub-skill: "agent"` and `domain: "Agent"`. Their `message` is self-contained because there is no knowledge-file footer to fall back on.
 
-Before a super-skill emits an agent finding, it validates the candidate against the BCQuality knowledge already loaded for the task: a matching file upgrades the candidate to a knowledge-backed finding (and merges or deduplicates against the relevant sub-skill output); a contradicting file suppresses the candidate. Only candidates with no BCQuality coverage become agent findings.
+Before a skill emits an agent finding, it validates the candidate against the BCQuality knowledge already loaded for the task: a matching file upgrades the candidate to a knowledge-backed finding (and merges or deduplicates against relevant existing output); a contradicting file suppresses the candidate. Only candidates with no BCQuality coverage become agent findings.
 
-Orchestrators MAY render the two kinds differently — for example, by labelling agent findings or routing them to a separate review domain — and MAY apply independent severity floors. The `from-sub-skill: "agent"` marker is the contract.
+Orchestrators MUST tolerate an absent `domain` in reports from older producers. When it is present, treat it as display text rather than an identifier: preserve the full string and its case, whitespace, punctuation, and non-ASCII characters, escaping only for the target rendering format. Do not tokenize it on spaces or use a lowercased or slugified form as the sole metadata or deduplication key, because distinct labels can collapse to the same slug. Retain the exact string, use a lossless encoding, or use a collision-resistant digest instead. Orchestrators MAY render knowledge-backed and agent findings differently and MAY apply independent severity floors; `references: []` and the `agent:` id prefix distinguish agent findings, while `from-sub-skill: "agent"` identifies those emitted by the super-skill itself.
 
 ## Why this architecture
 
 - **Entry is the only hardcoded thing.** Orchestrators ship with one convention — *"invoke `/skills/entry.md` first"* — and nothing else. New action skills and new knowledge files are picked up automatically because Entry discovers them at dispatch time.
+- **Standalone installation adds an adapter, not another policy layer.** The
+  plugin's host-format `al-code-review` skill only translates the invocation
+  into Entry's task context. Entry and the dispatched action skills remain
+  authoritative.
 - **Layers decide authority, not code.** The agent sees `/microsoft/` and `/community/` together; if two files conflict, the precedence rule defined in READ resolves it. A partner fork can disable `/community/` — that's a config choice, not a code change.
-- **Knowledge and skills evolve independently.** A new knowledge file requires no skill changes — existing skills pick it up via frontmatter filters. A new skill requires no knowledge changes — it sources from what's already there.
+- **Knowledge and skills evolve independently within their owning layer.** A new knowledge file requires no skill changes because existing skills pick it up via frontmatter filters. Layer placement still follows skill ownership, so promoting a skill also promotes its canonical corpus.
 
 ## The mental model, in one sentence
 
